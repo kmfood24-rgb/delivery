@@ -27,6 +27,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# Не писати в логи адреси запитів до Telegram — у них міститься токен бота
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ==== НАЛАШТУВАННЯ (з environment variables) ====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -108,6 +110,11 @@ gc = get_sheets_client()
 spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
 orders_sheet = spreadsheet.worksheet(SHEET_ORDERS)
 users_sheet = spreadsheet.worksheet(SHEET_USERS)
+
+
+def clean_lines(text: str) -> str:
+    """Прибирає пробіли на початку і в кінці кожного рядка та порожні рядки."""
+    return "\n".join(l.strip() for l in text.splitlines() if l.strip())
 
 
 def digits_only(value) -> str:
@@ -455,7 +462,7 @@ async def ask_zaklad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Збирає замовлення з одного або кількох повідомлень, поки людина не натисне «Далі»."""
-    context.user_data.setdefault("order_parts", []).append(update.message.text.strip())
+    context.user_data.setdefault("order_parts", []).append(clean_lines(update.message.text))
     await update.message.reply_text(
         "Записав ✅\n\n"
         f"Якщо це все — натисніть «{BTN_NEXT}» внизу 👇\n"
@@ -481,7 +488,7 @@ async def order_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = clean_lines(update.message.text)
     context.user_data["comment"] = NO_COMMENT_VALUE if text == BTN_NO_COMMENT else text
     context.user_data.pop("editing", None)
     return await go_to_confirm(update, context)

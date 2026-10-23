@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -9,7 +11,6 @@ from google.oauth2.service_account import Credentials
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telegram.ext import (
@@ -35,8 +36,62 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]  # вміст JS
 SHEET_ORDERS = "Замовлення"
 SHEET_USERS = "Users"
 
+# Час замовлень записуємо за Києвом (сервер Railway працює в UTC)
+TIMEZONE = ZoneInfo("Europe/Kyiv")
+
+# Скільки попередніх закладів показувати кнопками
+MAX_ZAKLAD_BUTTONS = 6
+
 # Стани розмови
-ASK_NAME, ASK_PHONE, ASK_ZAKLAD, ASK_ORDER, ASK_COMMENT = range(5)
+ASK_NAME, ASK_PHONE, ASK_ZAKLAD, ASK_ORDER, ASK_COMMENT, CONFIRM, EDIT_CHOICE = range(7)
+
+# ==== ТЕКСТИ КНОПОК ====
+BTN_NEW_ORDER = "🛒 Зробити замовлення"
+BTN_OLD_NEW_ORDER = "🔄 Нове замовлення"  # стара кнопка, може залишитись у людей на екрані
+BTN_REPEAT = "🔁 Повторити минуле замовлення"
+BTN_CANCEL = "❌ Скасувати"
+BTN_SHARE_CONTACT = "📱 Надіслати мій номер"
+BTN_NO_COMMENT = "Без коментаря"
+BTN_CONFIRM = "✅ Все вірно, відправити"
+BTN_EDIT = "✏️ Виправити"
+BTN_EDIT_ZAKLAD = "Заклад"
+BTN_EDIT_ORDER = "Замовлення"
+BTN_EDIT_COMMENT = "Коментар"
+BTN_NEXT = "➡️ Далі"
+
+# ==== ТЕКСТИ ПІДКАЗОК ====
+TEXT_ASK_ZAKLAD_NEW = (
+    "Крок 1 з 3. Напишіть лише назву вашого закладу, одним рядком.\n"
+    "Товари будемо писати на наступному кроці.\n\n"
+    "Наприклад: Лофт 26"
+)
+TEXT_ASK_ZAKLAD_CHOOSE = (
+    "Крок 1 з 3. Оберіть заклад кнопкою внизу 👇\n\n"
+    "Якщо потрібен інший заклад — напишіть лише його назву, одним рядком."
+)
+TEXT_ASK_ORDER = (
+    "Крок 2 з 3. Напишіть, що потрібно привезти.\n\n"
+    "Кожен товар — з нового рядка. Для кожного вкажіть:\n"
+    "• що саме: вид, сорт, жирність\n"
+    "• скільки: кг, шт, ящиків, пачок\n\n"
+    "Наприклад:\n"
+    "Цибуля зелена — 0,3 кг\n"
+    "Капуста пекінська — 2 кг\n"
+    "Молоко 2,5% — 1 ящик\n"
+    "Вершки 33%, по 1 л — 6 шт\n"
+    "Сир моцарела — 1 кг\n"
+    "Лайм — 5 шт\n\n"
+    "Можна надіслати кількома повідомленнями — бот усе збере.\n"
+    f"Коли закінчите, натисніть «{BTN_NEXT}» внизу."
+)
+TEXT_ASK_COMMENT = (
+    "Крок 3 з 3. Є побажання до замовлення? Наприклад, зручний час доставки "
+    "або чим замінити товар, якщо його не буде.\n\n"
+    f"Напишіть їх або натисніть «{BTN_NO_COMMENT}» 👇"
+)
+
+NO_COMMENT_VALUE = "-"  # що записується в таблицю, якщо коментаря немає
+
 
 # ==== ПІДКЛЮЧЕННЯ ДО GOOGLE SHEETS ====
 def get_sheets_client():
@@ -53,6 +108,10 @@ gc = get_sheets_client()
 spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
 orders_sheet = spreadsheet.worksheet(SHEET_ORDERS)
 users_sheet = spreadsheet.worksheet(SHEET_USERS)
+
+
+def digits_only(value) -> str:
+    return re.sub(r"\D", "", str(value))
 
 
 def get_user(chat_id: int):
@@ -72,10 +131,36 @@ def save_user(chat_id: int, name: str, phone: str):
     users_sheet.append_row([chat_id, name, phone])
 
 
+def get_user_orders(phone: str):
+    """Усі замовлення цього телефону з аркуша «Замовлення», від старих до нових.
+    Колонки: A дата, B ім'я, C телефон, D заклад, E замовлення, F коментар."""
+    target = digits_only(phone)
+    if not target:
+        return []
+    result = []
+    for row in orders_sheet.get_all_values()[1:]:
+        row = row + [""] * (6 - len(row))
+        if digits_only(row[2]) == target:
+            result.append({"zaklad": row[3], "order": row[4], "comment": row[5]})
+    return result
+
+
+def get_recent_zaklady(phone: str):
+    """Заклади, на які людина вже замовляла, — від останнього до старших, без повторів."""
+    seen = []
+    for o in reversed(get_user_orders(phone)):
+        z = o["zaklad"].strip()
+        if z and z not in seen:
+            seen.append(z)
+        if len(seen) >= MAX_ZAKLAD_BUTTONS:
+            break
+    return seen
+
+
 def write_order(name, phone, zaklad, order, comment):
     orders_sheet.append_row(
         [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
             name,
             phone,
             zaklad,
@@ -85,128 +170,476 @@ def write_order(name, phone, zaklad, order, comment):
     )
 
 
+def normalize_typed_phone(text: str):
+    """Приймає номер, набраний вручну: 0671234567, +380671234567, 067 123 45 67 тощо.
+    Повертає 380XXXXXXXXX (як у таблиці) або None, якщо номер не схожий на український."""
+    d = digits_only(text)
+    if len(d) == 10 and d.startswith("0"):
+        d = "38" + d
+    if len(d) == 12 and d.startswith("380"):
+        return d
+    return None
+
+
 # ==== КЛАВІАТУРИ ====
-def contact_keyboard():
+def keyboard(rows):
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def main_menu_keyboard():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Поділитись контактом", request_contact=True)]],
+        [[BTN_NEW_ORDER], [BTN_REPEAT]],
         resize_keyboard=True,
-        one_time_keyboard=True,
+        is_persistent=True,
     )
 
 
-def start_keyboard():
-    return ReplyKeyboardMarkup(
-        [["🔄 Нове замовлення"]], resize_keyboard=True, one_time_keyboard=True
+def cancel_keyboard():
+    return keyboard([[BTN_CANCEL]])
+
+
+def contact_keyboard():
+    return keyboard(
+        [[KeyboardButton(BTN_SHARE_CONTACT, request_contact=True)], [BTN_CANCEL]]
     )
+
+
+def zaklad_keyboard(zaklady):
+    rows = [[z] for z in zaklady]
+    rows.append([BTN_CANCEL])
+    return keyboard(rows)
+
+
+def comment_keyboard():
+    return keyboard([[BTN_NO_COMMENT], [BTN_CANCEL]])
+
+
+def confirm_keyboard():
+    return keyboard([[BTN_CONFIRM], [BTN_EDIT], [BTN_CANCEL]])
+
+
+def edit_keyboard():
+    return keyboard([[BTN_EDIT_ZAKLAD], [BTN_EDIT_ORDER], [BTN_EDIT_COMMENT], [BTN_CANCEL]])
+
+
+def order_keyboard():
+    return keyboard([[BTN_NEXT], [BTN_CANCEL]])
+
+
+# ==== ДОПОМІЖНІ ====
+# Рядок схожий на товар, якщо в ньому є число з одиницею виміру: «2кг», «0.300 г», «5 шт», «1ящ»
+ITEM_PATTERN = re.compile(
+    r"\d[\d.,]*\s*-?\s*(?:"
+    r"(?:кг|гр|г|л|мл)(?![а-яіїєґa-z])"  # короткі одиниці — лише окремим словом
+    r"|(?:шт|ящ|пач|уп|бан|пак|пучк|лот)[а-яіїєґ]*"  # «ящ», «ящики», «пачки»...
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_item(text: str) -> bool:
+    return bool(ITEM_PATTERN.search(text))
+
+
+def greeting(name: str = "") -> str:
+    """Привітання за київським часом: «Доброго ранку, Олена! 👋»."""
+    hour = datetime.now(TIMEZONE).hour
+    if 5 <= hour < 11:
+        hello = "Доброго ранку"
+    elif 11 <= hour < 17:
+        hello = "Доброго дня"
+    elif 17 <= hour < 23:
+        hello = "Доброго вечора"
+    else:
+        hello = "Доброї ночі"
+    return f"{hello}, {name}! 👋" if name else f"{hello}! 👋"
+
+
+def order_summary(data) -> str:
+    comment = data.get("comment") or NO_COMMENT_VALUE
+    comment_text = "немає" if comment == NO_COMMENT_VALUE else comment
+    return (
+        f"🏠 Заклад: {data.get('zaklad', '')}\n\n"
+        f"📦 Замовлення:\n{data.get('order', '')}\n\n"
+        f"💬 Коментар: {comment_text}"
+    )
+
+
+def clear_order(context):
+    for key in ("zaklad", "order", "order_parts", "comment", "editing"):
+        context.user_data.pop(key, None)
+
+
+async def load_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Підтягує ім'я і телефон з таблиці. Повертає True, якщо людина вже зареєстрована."""
+    user = get_user(update.effective_chat.id)
+    if user:
+        context.user_data["name"] = user["name"]
+        context.user_data["phone"] = user["phone"]
+        return True
+    return False
+
+
+async def go_to_zaklad(update: Update, context: ContextTypes.DEFAULT_TYPE, intro: str = ""):
+    zaklady = get_recent_zaklady(context.user_data.get("phone", ""))
+    if zaklady:
+        text = TEXT_ASK_ZAKLAD_CHOOSE
+        markup = zaklad_keyboard(zaklady)
+    else:
+        text = TEXT_ASK_ZAKLAD_NEW
+        markup = cancel_keyboard()
+    if intro:
+        text = intro + "\n\n" + text
+    await update.message.reply_text(text, reply_markup=markup)
+    return ASK_ZAKLAD
+
+
+async def go_to_order(update: Update, context: ContextTypes.DEFAULT_TYPE, intro: str = ""):
+    parts = context.user_data.get("order_parts", [])
+    if parts:
+        # Частина замовлення вже є (людина написала товари разом із закладом)
+        text = (
+            "Крок 2 з 3. Ось що вже записано в замовлення:\n\n"
+            + "\n".join(parts)
+            + f"\n\nЯкщо це все — натисніть «{BTN_NEXT}».\n"
+            "Якщо щось забули — просто допишіть."
+        )
+        markup = order_keyboard()
+    else:
+        text = TEXT_ASK_ORDER
+        markup = cancel_keyboard()
+    if intro:
+        text = intro + "\n\n" + text
+    await update.message.reply_text(text, reply_markup=markup)
+    return ASK_ORDER
+
+
+async def go_to_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TEXT_ASK_COMMENT, reply_markup=comment_keyboard())
+    return ASK_COMMENT
+
+
+async def go_to_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str = None):
+    title = title or "Перевірте, будь ласка, ваше замовлення:"
+    await update.message.reply_text(
+        f"{title}\n\n{order_summary(context.user_data)}\n\n"
+        f"Якщо все правильно — натисніть «{BTN_CONFIRM}».",
+        reply_markup=confirm_keyboard(),
+    )
+    return CONFIRM
+
+
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"{greeting()}\n\nЦе бот для замовлень. Спочатку познайомимось — "
+        "це потрібно лише один раз.\n\nНапишіть, як вас звати:",
+        reply_markup=cancel_keyboard(),
+    )
+    return ASK_NAME
 
 
 # ==== ХЕНДЛЕРИ ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = get_user(chat_id)
+    """/start і кнопка «Зробити замовлення»."""
+    clear_order(context)
+    if await load_user(update, context):
+        return await go_to_zaklad(update, context, greeting(context.user_data["name"]))
+    return await start_registration(update, context)
 
-    if user:
-        context.user_data["name"] = user["name"]
-        context.user_data["phone"] = user["phone"]
-        await update.message.reply_text(
-            f"Привіт, {user['name']}! Введіть назву закладу:",
-            reply_markup=ReplyKeyboardRemove(),
+
+async def repeat_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Повторити минуле замовлення»."""
+    clear_order(context)
+    if not await load_user(update, context):
+        return await start_registration(update, context)
+
+    hello = greeting(context.user_data["name"])
+    orders = get_user_orders(context.user_data["phone"])
+    if not orders:
+        return await go_to_zaklad(
+            update, context, f"{hello}\n\nМинулих замовлень поки немає — оформимо нове."
         )
-        return ASK_ZAKLAD
-    else:
-        await update.message.reply_text(
-            "Вітаємо! Як вас звати?", reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_NAME
+
+    last = orders[-1]
+    context.user_data["zaklad"] = last["zaklad"]
+    context.user_data["order"] = last["order"]
+    context.user_data["comment"] = last["comment"] or NO_COMMENT_VALUE
+    return await go_to_confirm(
+        update,
+        context,
+        f"{hello}\n\nОсь ваше минуле замовлення. Його можна відправити ще раз "
+        "або спочатку виправити:",
+    )
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
+    name = update.message.text.strip()
+    context.user_data["name"] = name
     await update.message.reply_text(
-        f"Дякую, {update.message.text}! Тепер поділіться номером телефону "
-        f"(це потрібно лише один раз):",
+        f"Приємно познайомитись, {name}!\n\n"
+        f"Тепер натисніть кнопку «{BTN_SHARE_CONTACT}» внизу 👇\n\n"
+        "Або напишіть номер телефону цифрами, наприклад: 0671234567",
         reply_markup=contact_keyboard(),
     )
     return ASK_PHONE
 
 
-async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    if not contact:
+async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
+    context.user_data["phone"] = phone
+    save_user(update.effective_chat.id, context.user_data["name"], phone)
+    return await go_to_zaklad(update, context, "Дякуємо, номер збережено ✅")
+
+
+async def ask_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await phone_received(update, context, update.message.contact.phone_number)
+
+
+async def ask_phone_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = normalize_typed_phone(update.message.text)
+    if not phone:
         await update.message.reply_text(
-            'Будь ласка, скористайтесь кнопкою "Поділитись контактом" нижче 👇',
+            "Не вдалося розпізнати номер 🙁\n\n"
+            f"Найпростіше — натисніть кнопку «{BTN_SHARE_CONTACT}» внизу 👇\n\n"
+            "Або напишіть номер ще раз, лише цифрами, наприклад: 0671234567",
             reply_markup=contact_keyboard(),
         )
         return ASK_PHONE
-
-    chat_id = update.effective_chat.id
-    phone = contact.phone_number
-    name = context.user_data["name"]
-    context.user_data["phone"] = phone
-    save_user(chat_id, name, phone)
-
-    await update.message.reply_text(
-        "Введіть назву закладу:", reply_markup=ReplyKeyboardRemove()
-    )
-    return ASK_ZAKLAD
+    return await phone_received(update, context, phone)
 
 
 async def ask_zaklad(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["zaklad"] = update.message.text
-    await update.message.reply_text("Опишіть замовлення:")
-    return ASK_ORDER
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    editing = context.user_data.get("editing", False)
+
+    # Людина написала одразу і заклад, і товари (як «Шо таке Азія» + список)
+    if len(lines) > 1:
+        if editing:
+            await update.message.reply_text(
+                "Напишіть, будь ласка, лише назву закладу, одним рядком.",
+                reply_markup=zaklad_keyboard(
+                    get_recent_zaklady(context.user_data.get("phone", ""))
+                ),
+            )
+            return ASK_ZAKLAD
+        if looks_like_item(lines[0]):
+            # Перший рядок — теж товар, тобто назви закладу тут немає
+            context.user_data.setdefault("order_parts", []).append("\n".join(lines))
+            return await go_to_zaklad(
+                update,
+                context,
+                "Схоже, ви одразу написали замовлення — я його запам'ятав ✅\n"
+                "Але спочатку потрібна назва закладу.",
+            )
+        context.user_data["zaklad"] = lines[0]
+        context.user_data.setdefault("order_parts", []).append("\n".join(lines[1:]))
+        return await go_to_order(
+            update, context, f"Заклад: {lines[0]} ✅\nРешту я переніс у замовлення."
+        )
+
+    # Один рядок, але схожий на товар («Морква 2кг»), а не на назву закладу
+    if looks_like_item(text) and not editing:
+        context.user_data.setdefault("order_parts", []).append(text)
+        return await go_to_zaklad(
+            update,
+            context,
+            "Схоже, це товар із замовлення — я його запам'ятав ✅\n"
+            "Але спочатку потрібна назва закладу.",
+        )
+
+    context.user_data["zaklad"] = text
+    if context.user_data.pop("editing", False):
+        return await go_to_confirm(update, context)
+    return await go_to_order(update, context, f"Заклад: {text} ✅")
 
 
 async def ask_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order"] = update.message.text
+    """Збирає замовлення з одного або кількох повідомлень, поки людина не натисне «Далі»."""
+    context.user_data.setdefault("order_parts", []).append(update.message.text.strip())
     await update.message.reply_text(
-        'Додайте коментар (або напишіть "-", якщо коментаря немає):'
+        "Записав ✅\n\n"
+        f"Якщо це все — натисніть «{BTN_NEXT}» внизу 👇\n"
+        "Якщо щось забули — просто допишіть ще одним повідомленням.",
+        reply_markup=order_keyboard(),
     )
-    return ASK_COMMENT
+    return ASK_ORDER
+
+
+async def order_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = context.user_data.get("order_parts", [])
+    if not parts:
+        await update.message.reply_text(
+            "Замовлення поки порожнє. Напишіть, що потрібно привезти 👇",
+            reply_markup=cancel_keyboard(),
+        )
+        return ASK_ORDER
+    context.user_data["order"] = "\n".join(parts)
+    context.user_data.pop("order_parts", None)
+    if context.user_data.pop("editing", False):
+        return await go_to_confirm(update, context)
+    return await go_to_comment(update, context)
 
 
 async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    comment = update.message.text
-    write_order(
-        context.user_data["name"],
-        context.user_data["phone"],
-        context.user_data["zaklad"],
-        context.user_data["order"],
-        comment,
-    )
+    text = update.message.text.strip()
+    context.user_data["comment"] = NO_COMMENT_VALUE if text == BTN_NO_COMMENT else text
+    context.user_data.pop("editing", None)
+    return await go_to_confirm(update, context)
+
+
+async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
+    try:
+        write_order(
+            data["name"],
+            data["phone"],
+            data["zaklad"],
+            data["order"],
+            data.get("comment") or NO_COMMENT_VALUE,
+        )
+    except Exception:
+        logger.exception("Не вдалося записати замовлення в таблицю")
+        await update.message.reply_text(
+            "⚠️ На жаль, замовлення не вдалося відправити через технічну помилку.\n\n"
+            f"Спробуйте натиснути «{BTN_CONFIRM}» ще раз через хвилину.",
+            reply_markup=confirm_keyboard(),
+        )
+        return CONFIRM
+
+    summary = order_summary(data)
+    name = data.get("name", "")
+    clear_order(context)
     await update.message.reply_text(
-        "Дякуємо! Ваше замовлення прийнято ✅", reply_markup=start_keyboard()
+        "✅ Ваше замовлення прийнято!\n\n"
+        f"{summary}\n\n"
+        f"Дякуємо{', ' + name if name else ''}! Гарного дня 🙂\n\n"
+        f"Щоб зробити нове замовлення, натисніть «{BTN_NEW_ORDER}» внизу 👇",
+        reply_markup=main_menu_keyboard(),
     )
     return ConversationHandler.END
+
+
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Що потрібно виправити? Натисніть кнопку внизу 👇",
+        reply_markup=edit_keyboard(),
+    )
+    return EDIT_CHOICE
+
+
+async def edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text
+    context.user_data["editing"] = True
+    if choice == BTN_EDIT_ZAKLAD:
+        return await go_to_zaklad(update, context)
+    if choice == BTN_EDIT_ORDER:
+        context.user_data.pop("order_parts", None)
+        await update.message.reply_text(
+            "Напишіть замовлення заново, повністю.\n\n"
+            f"Зараз записано:\n{context.user_data.get('order', '')}",
+            reply_markup=cancel_keyboard(),
+        )
+        return ASK_ORDER
+    if choice == BTN_EDIT_COMMENT:
+        return await go_to_comment(update, context)
+    context.user_data.pop("editing", None)
+    await update.message.reply_text(
+        "Будь ласка, натисніть одну з кнопок внизу 👇", reply_markup=edit_keyboard()
+    )
+    return EDIT_CHOICE
+
+
+async def confirm_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """На кроці перевірки людина щось написала замість кнопки."""
+    await update.message.reply_text(
+        f"Щоб відправити замовлення, натисніть «{BTN_CONFIRM}».\n"
+        f"Щоб змінити щось — «{BTN_EDIT}».",
+        reply_markup=confirm_keyboard(),
+    )
+    return CONFIRM
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_order(context)
     await update.message.reply_text(
-        "Скасовано. Натисніть кнопку нижче, щоб почати нове замовлення.",
-        reply_markup=start_keyboard(),
+        "Замовлення скасовано.\n\n"
+        f"Щоб почати нове, натисніть «{BTN_NEW_ORDER}» внизу 👇",
+        reply_markup=main_menu_keyboard(),
     )
     return ConversationHandler.END
+
+
+async def not_text_in_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фото, голосове, стікер тощо посеред оформлення замовлення."""
+    await update.message.reply_text(
+        "Голосові повідомлення, фото та стікери бот, на жаль, не розуміє.\n"
+        "Будь ласка, напишіть текстом або натисніть кнопку внизу.\n\n"
+        f"Щоб почати спочатку — «{BTN_CANCEL}»."
+    )
+    return None  # залишаємось на тому ж кроці
+
+
+async def any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Будь-яке повідомлення поза оформленням замовлення — вітаємось і показуємо меню."""
+    if not update.message:
+        return
+    user = get_user(update.effective_chat.id)
+    await update.message.reply_text(
+        f"{greeting(user['name'] if user else '')}\n\n"
+        f"Щоб зробити замовлення, натисніть «{BTN_NEW_ORDER}» внизу 👇",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
+    def exact(text):
+        return filters.Regex(f"^{re.escape(text)}$")
+
+    cancel_filter = exact(BTN_CANCEL)
+    free_text = filters.TEXT & ~filters.COMMAND & ~cancel_filter
+    cancel_handler = MessageHandler(cancel_filter, cancel)
+
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(filters.Regex("^🔄 Нове замовлення$"), start),
+            MessageHandler(exact(BTN_NEW_ORDER), start),
+            MessageHandler(exact(BTN_OLD_NEW_ORDER), start),
+            MessageHandler(exact(BTN_REPEAT), repeat_order),
         ],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_PHONE: [MessageHandler(filters.CONTACT, ask_phone)],
-            ASK_ZAKLAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_zaklad)],
-            ASK_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_order)],
-            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_comment)],
+            ASK_NAME: [cancel_handler, MessageHandler(free_text, ask_name)],
+            ASK_PHONE: [
+                cancel_handler,
+                MessageHandler(filters.CONTACT, ask_phone_contact),
+                MessageHandler(free_text, ask_phone_text),
+            ],
+            ASK_ZAKLAD: [cancel_handler, MessageHandler(free_text, ask_zaklad)],
+            ASK_ORDER: [
+                cancel_handler,
+                MessageHandler(exact(BTN_NEXT), order_done),
+                MessageHandler(free_text, ask_order),
+            ],
+            ASK_COMMENT: [cancel_handler, MessageHandler(free_text, ask_comment)],
+            CONFIRM: [
+                cancel_handler,
+                MessageHandler(exact(BTN_CONFIRM), confirm_order),
+                MessageHandler(exact(BTN_EDIT), edit_start),
+                MessageHandler(free_text, confirm_other),
+            ],
+            EDIT_CHOICE: [cancel_handler, MessageHandler(free_text, edit_choice)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.ALL & ~filters.COMMAND, not_text_in_dialog),
+        ],
+        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
+    # Усе, що прийшло поза оформленням замовлення (наприклад, «Привіт»)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, any_message))
 
     logger.info("Бот запущено, чекаю на повідомлення...")
     application.run_polling()

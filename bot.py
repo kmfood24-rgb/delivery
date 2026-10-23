@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -19,8 +20,10 @@ from telegram.ext import (
     MessageHandler,
     ConversationHandler,
     ContextTypes,
+    ApplicationHandlerStop,
     filters,
 )
+from telegram.error import Forbidden, RetryAfter
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,6 +37,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]  # вміст JSON-ключа service account одним рядком
+
+# Хто може робити розсилку: chat_id через кому (беруться з колонки A аркуша Users).
+# Якщо змінну не задано — розсилка вимкнена, решта бота працює як завжди.
+ADMIN_CHAT_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_CHAT_IDS", "")) if x.strip().lstrip("-").isdigit()
+}
 
 SHEET_ORDERS = "Замовлення"
 SHEET_USERS = "Users"
@@ -598,6 +607,137 @@ async def any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ==== РОЗСИЛКА ВСІМ КЛІЄНТАМ (лише для адміністраторів) ====
+BC_TEXT, BC_CONFIRM = 100, 101
+BTN_BC_SEND = "✅ Надіслати всім"
+MAIN_CONV = None  # посилання на основну розмову (оформлення замовлення)
+
+
+def reset_main_conversation(update: Update):
+    """Якщо адмін почав розсилку посеред оформлення замовлення — скидаємо те замовлення,
+    щоб його наступні повідомлення не потрапили в поле «заклад»."""
+    try:
+        MAIN_CONV._conversations.pop((update.effective_chat.id, update.effective_user.id), None)
+    except Exception:
+        pass
+
+
+def get_all_chat_ids():
+    ids = []
+    for row in users_sheet.get_all_values()[1:]:
+        if row and str(row[0]).strip().lstrip("-").isdigit():
+            cid = int(str(row[0]).strip())
+            if cid not in ids:
+                ids.append(cid)
+    return ids
+
+
+async def bc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_main_conversation(update)
+    clear_order(context)
+    context.user_data.pop("bc_msg", None)
+    await update.message.reply_text(
+        "📢 Розсилка всім клієнтам.\n\n"
+        "Надішліть боту те, що мають отримати клієнти:\n"
+        "• текст, або\n"
+        "• одне фото з підписом, або\n"
+        "• одне відео з підписом.\n\n"
+        "Підпис додається в полі під фото/відео перед відправкою.",
+        reply_markup=cancel_keyboard(),
+    )
+    raise ApplicationHandlerStop(BC_TEXT)
+
+
+async def bc_got_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отримали текст, фото або відео. Запам'ятовуємо саме повідомлення —
+    клієнтам буде надіслана його копія (з підписом і форматуванням)."""
+    msg = update.message
+    context.user_data["bc_msg"] = (msg.chat_id, msg.message_id)
+    count = len(get_all_chat_ids())
+    await msg.reply_text("Ось так клієнти побачать повідомлення 👇")
+    await context.bot.copy_message(
+        chat_id=msg.chat_id, from_chat_id=msg.chat_id, message_id=msg.message_id
+    )
+    await msg.reply_text(
+        f"Отримувачів: {count}.\n\nНадіслати?",
+        reply_markup=keyboard([[BTN_BC_SEND], [BTN_CANCEL]]),
+    )
+    raise ApplicationHandlerStop(BC_CONFIRM)
+
+
+async def bc_wrong_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Для розсилки підходять лише текст, одне фото або одне відео.\n"
+        "Надішліть, будь ласка, щось із цього.",
+        reply_markup=cancel_keyboard(),
+    )
+    raise ApplicationHandlerStop(BC_TEXT)
+
+
+async def bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    source = context.user_data.pop("bc_msg", None)
+    if not source:
+        await update.message.reply_text("Повідомлення для розсилки не знайдено. Почніть знову: /rozsylka",
+                                        reply_markup=main_menu_keyboard())
+        raise ApplicationHandlerStop(ConversationHandler.END)
+    from_chat_id, message_id = source
+
+    try:
+        chat_ids = get_all_chat_ids()
+    except Exception:
+        logger.exception("Розсилка: не вдалося прочитати аркуш Users")
+        await update.message.reply_text(
+            "⚠️ Не вдалося прочитати список клієнтів з таблиці. Спробуйте пізніше: /rozsylka",
+            reply_markup=main_menu_keyboard(),
+        )
+        raise ApplicationHandlerStop(ConversationHandler.END)
+    await update.message.reply_text(f"Надсилаю {len(chat_ids)} клієнтам, зачекайте…")
+    sent, blocked, failed = 0, 0, 0
+    for cid in chat_ids:
+        for attempt in range(2):
+            try:
+                await context.bot.copy_message(
+                    chat_id=cid,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id,
+                    reply_markup=main_menu_keyboard(),
+                )
+                sent += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
+            except Forbidden:
+                blocked += 1
+                break
+            except Exception:
+                logger.exception("Розсилка: не вдалося надіслати %s", cid)
+                failed += 1
+                break
+        await asyncio.sleep(0.06)  # не більше ~15 повідомлень на секунду
+
+    report = f"✅ Розсилку завершено.\n\nНадіслано: {sent}"
+    if blocked:
+        report += f"\nЗаблокували бота або видалили чат: {blocked}"
+    if failed:
+        report += f"\nНе вдалося надіслати через помилку: {failed}"
+    await update.message.reply_text(report, reply_markup=main_menu_keyboard())
+    raise ApplicationHandlerStop(ConversationHandler.END)
+
+
+async def bc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("bc_msg", None)
+    await update.message.reply_text("Розсилку скасовано.", reply_markup=main_menu_keyboard())
+    raise ApplicationHandlerStop(ConversationHandler.END)
+
+
+async def bc_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Натисніть «{BTN_BC_SEND}» або «{BTN_CANCEL}».",
+        reply_markup=keyboard([[BTN_BC_SEND], [BTN_CANCEL]]),
+    )
+    raise ApplicationHandlerStop(BC_CONFIRM)
+
+
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -645,6 +785,34 @@ def main():
     )
 
     application.add_handler(conv_handler)
+    global MAIN_CONV
+    MAIN_CONV = conv_handler
+
+    if ADMIN_CHAT_IDS:
+        admin = filters.Chat(chat_id=ADMIN_CHAT_IDS)
+        bc_cancel_handler = MessageHandler(admin & (cancel_filter | filters.Regex("^/cancel")), bc_cancel)
+        broadcast_handler = ConversationHandler(
+            entry_points=[CommandHandler("rozsylka", bc_start, filters=admin)],
+            states={
+                BC_TEXT: [
+                    bc_cancel_handler,
+                    MessageHandler(
+                        admin & ((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.VIDEO),
+                        bc_got_content,
+                    ),
+                    MessageHandler(admin & ~filters.COMMAND, bc_wrong_content),
+                ],
+                BC_CONFIRM: [
+                    bc_cancel_handler,
+                    MessageHandler(admin & exact(BTN_BC_SEND), bc_send),
+                    MessageHandler(admin & filters.TEXT & ~filters.COMMAND, bc_other),
+                ],
+            },
+            fallbacks=[],
+            allow_reentry=True,
+        )
+        # Група -1: перевіряється раніше за оформлення замовлення, щоб не змішувались
+        application.add_handler(broadcast_handler, group=-1)
     # Усе, що прийшло поза оформленням замовлення (наприклад, «Привіт»)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, any_message))
 

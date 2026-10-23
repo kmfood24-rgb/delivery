@@ -622,14 +622,20 @@ def reset_main_conversation(update: Update):
         pass
 
 
-def get_all_chat_ids():
-    ids = []
+def get_all_recipients():
+    """{chat_id: «Ім'я, телефон»} з аркуша Users, без повторів."""
+    people = {}
     for row in users_sheet.get_all_values()[1:]:
-        if row and str(row[0]).strip().lstrip("-").isdigit():
+        row = row + [""] * (3 - len(row))
+        if str(row[0]).strip().lstrip("-").isdigit():
             cid = int(str(row[0]).strip())
-            if cid not in ids:
-                ids.append(cid)
-    return ids
+            if cid not in people:
+                people[cid] = ", ".join(x for x in (row[1].strip(), row[2].strip()) if x) or str(cid)
+    return people
+
+
+def get_all_chat_ids():
+    return list(get_all_recipients())
 
 
 async def bc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -683,7 +689,8 @@ async def bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from_chat_id, message_id = source
 
     try:
-        chat_ids = get_all_chat_ids()
+        people = get_all_recipients()
+        chat_ids = list(people)
     except Exception:
         logger.exception("Розсилка: не вдалося прочитати аркуш Users")
         await update.message.reply_text(
@@ -692,7 +699,7 @@ async def bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         raise ApplicationHandlerStop(ConversationHandler.END)
     await update.message.reply_text(f"Надсилаю {len(chat_ids)} клієнтам, зачекайте…")
-    sent, blocked, failed = 0, 0, 0
+    sent, blocked, failed = 0, [], []
     for cid in chat_ids:
         for attempt in range(2):
             try:
@@ -707,20 +714,24 @@ async def bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except RetryAfter as e:
                 await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
             except Forbidden:
-                blocked += 1
+                blocked.append(people[cid])
                 break
             except Exception:
                 logger.exception("Розсилка: не вдалося надіслати %s", cid)
-                failed += 1
+                failed.append(people[cid])
                 break
         await asyncio.sleep(0.06)  # не більше ~15 повідомлень на секунду
 
     report = f"✅ Розсилку завершено.\n\nНадіслано: {sent}"
     if blocked:
-        report += f"\nЗаблокували бота або видалили чат: {blocked}"
+        report += f"\n\n🚫 Заблокували бота або видалили чат ({len(blocked)}):\n"
+        report += "\n".join(f"• {p}" for p in blocked)
     if failed:
-        report += f"\nНе вдалося надіслати через помилку: {failed}"
-    await update.message.reply_text(report, reply_markup=main_menu_keyboard())
+        report += f"\n\n⚠️ Не вдалося надіслати через помилку ({len(failed)}):\n"
+        report += "\n".join(f"• {p}" for p in failed)
+    # Telegram обмежує довжину повідомлення 4096 символами — ділимо довгий звіт
+    for i in range(0, len(report), 4000):
+        await update.message.reply_text(report[i:i + 4000], reply_markup=main_menu_keyboard())
     raise ApplicationHandlerStop(ConversationHandler.END)
 
 
